@@ -1,0 +1,29 @@
+{
+  "name": "pi-comprehensive-status",
+  "version": "1.0.0",
+  "description": "Responsive Tokyo Night editor and comprehensive status dashboard for Pi Coding Agent",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "statusline",
+    "tokyo-night",
+    "ssh"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "ssh://git@github.com/SHZXZ/pi-comprehensive-status.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/comprehensive-status.ts"
+    ]
+  }
+}
