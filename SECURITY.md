@@ -13,5 +13,5 @@ Pi extensions execute with the same operating-system access as Pi. Review change
 For a private GitHub installation, prefer SSH authentication and a pinned release tag:
 
 ```bash
-pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.1
+pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.2
 ```

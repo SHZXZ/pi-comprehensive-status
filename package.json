@@ -1,6 +1,6 @@
 {
   "name": "pi-comprehensive-status",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Responsive Tokyo Night editor and comprehensive status dashboard for Pi Coding Agent",
   "private": true,
   "type": "module",
