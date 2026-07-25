@@ -1,6 +1,6 @@
 {
   "name": "pi-comprehensive-status",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Responsive Tokyo Night editor and comprehensive status dashboard for Pi Coding Agent",
   "private": true,
   "type": "module",
@@ -20,6 +20,17 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": [

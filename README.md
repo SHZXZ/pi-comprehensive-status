@@ -12,10 +12,10 @@ The target device must have Pi installed and an SSH key authorized for the
 
 ```bash
 ssh -T git@github.com
-pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.0
+pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.1
 ```
 
-Restart Pi or run `/reload` after installation. The `v1.0.0` tag is pinned, so
+Restart Pi or run `/reload` after installation. The `v1.0.1` tag is pinned, so
 all devices receive the same source. To move to a future tagged release, run
 `pi install` again with the new tag.
 
@@ -35,7 +35,7 @@ the editor and status widgets. Move the manual directory completely outside
 mkdir -p ~/.pi/agent/backups/statusbar
 mv ~/.pi/agent/extensions/comprehensive-status \
   ~/.pi/agent/backups/statusbar/comprehensive-status.manual
-pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.0
+pi install git:git@github.com:SHZXZ/pi-comprehensive-status.git@v1.0.1
 ```
 
 The Tokyo Night theme is optional but recommended. When using
