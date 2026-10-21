@@ -1,4 +1,3 @@
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import {
   CustomEditor,
   type ExtensionAPI,
@@ -14,38 +13,27 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { readFile, readdir } from "node:fs/promises";
-import { homedir } from "node:os";
+import { cpus, freemem, homedir, totalmem } from "node:os";
 import { basename, join, resolve } from "node:path";
-
-type UsageWithReasoning = Usage & { reasoning?: number };
-
-interface ModelUsageSnapshot {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  reasoning: number;
-}
+import {
+  MOBILE_STATUS_EVENT,
+  type MobileStatusRequest,
+} from "../../pi-moshi-pro/src/status-events.ts";
+import {
+  cacheHitRate,
+  calculateSessionStats,
+  fitDashboardItems,
+  formatMobileStatusLines,
+  formatTodoWorkflowText,
+  resolveTodoWorkflowState,
+  type SessionStats,
+} from "./status-state.ts";
 
 type EditorFactory = (
   tui: TUI,
   theme: EditorTheme,
   keybindings: KeybindingsManager,
 ) => EditorComponent;
-
-interface SessionStats {
-  calls: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  reasoning: number;
-  cost: number;
-  toolCalls: number;
-  mcpCalls: number;
-  lastModel?: ModelUsageSnapshot;
-  lastCacheHit: number | null;
-}
 
 interface ApiTelemetry {
   activeStart?: number;
@@ -56,9 +44,7 @@ interface ApiTelemetry {
   lastTtftMs?: number;
   lastTotalMs?: number;
   lastError?: string;
-  headers: number[];
   ttfts: number[];
-  totals: number[];
 }
 
 interface TaskTelemetry {
@@ -106,6 +92,7 @@ interface PowerlineModule {
 }
 
 interface DashboardItem {
+  id: string;
   text: string;
   priority: number;
 }
@@ -121,11 +108,20 @@ const LEFT_SEPARATOR = NERD_FONT ? "\uE0B2" : "‹";
 const SPARK_CHARS = "▁▂▃▄▅▆▇█";
 const SYSTEM_REFRESH_MS = 3_000;
 const GPU_REFRESH_EVERY = 2;
+const WINDOWS_CPU_TEMP_REFRESH_EVERY = 4;
+const WINDOWS_CPU_TEMP_RETRY_MS = 60_000;
+const WINDOWS_CPU_TEMP_MAX_AGE_MS = 30_000;
+const WINDOWS_CPU_TEMP_PATH = join(
+  resolve(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent")),
+  "runtime",
+  "windows-cpu-temperature.json",
+);
 
 type IconName =
   | "pi"
   | "model"
   | "thinking"
+  | "workflow"
   | "directory"
   | "session"
   | "git"
@@ -136,30 +132,39 @@ type IconName =
   | "api"
   | "rounds"
   | "tools"
+  | "mcp"
   | "cache"
-  | "latency"
-  | "usage"
+  | "response"
+  | "firstToken"
+  | "input"
+  | "output"
+  | "reasoning"
   | "task"
   | "warning"
   | "cost";
 
 const ICONS: Record<IconName, { nerd: string; fallback: string }> = {
   pi: { nerd: "\uE22C", fallback: "π" },
-  model: { nerd: "\uEC19", fallback: "" },
-  thinking: { nerd: "\uF0E7", fallback: "⚡" },
-  directory: { nerd: "\uF015", fallback: "⌂" },
+  model: { nerd: "\uEC19", fallback: "◈" },
+  thinking: { nerd: "\uF0EB", fallback: "✦" },
+  workflow: { nerd: "\uF0AE", fallback: "◇" },
+  directory: { nerd: "\uF07C", fallback: "⌂" },
   session: { nerd: "\uF550", fallback: "#" },
   git: { nerd: "\uF126", fallback: "⎇" },
   cpu: { nerd: "\uF2DB", fallback: "▣" },
   gpu: { nerd: "\uF108", fallback: "▦" },
   memory: { nerd: "\uF538", fallback: "▤" },
-  context: { nerd: "\uF1C0", fallback: "◫" },
+  context: { nerd: "\uF200", fallback: "◔" },
   api: { nerd: "\uF1EB", fallback: "●" },
   rounds: { nerd: "\uF021", fallback: "↻" },
   tools: { nerd: "\uF0AD", fallback: "⚙" },
+  mcp: { nerd: "\uF1B2", fallback: "◎" },
   cache: { nerd: "\uF1C0", fallback: "↺" },
-  latency: { nerd: "\uF017", fallback: "◷" },
-  usage: { nerd: "\uE26B", fallback: "Σ" },
+  response: { nerd: "\uF0EC", fallback: "↔" },
+  firstToken: { nerd: "\uF135", fallback: "»" },
+  input: { nerd: "\uF090", fallback: "↑" },
+  output: { nerd: "\uF08B", fallback: "↓" },
+  reasoning: { nerd: "\uF0EB", fallback: "◆" },
   task: { nerd: "\uF017", fallback: "◷" },
   warning: { nerd: "\uF071", fallback: "!" },
   cost: { nerd: "\uF155", fallback: "$" },
@@ -172,6 +177,10 @@ const PALETTE = {
   modelFg: [235, 239, 255] as RGB,
   thinkBg: [126, 79, 145] as RGB,
   thinkFg: [255, 239, 196] as RGB,
+  workflowNormalBg: [66, 71, 91] as RGB,
+  workflowPlanBg: [151, 105, 34] as RGB,
+  workflowExecuteBg: [44, 105, 145] as RGB,
+  workflowFg: [255, 249, 240] as RGB,
   dirBg: [22, 100, 122] as RGB,
   dirFg: [225, 252, 255] as RGB,
   sessionBg: [95, 77, 132] as RGB,
@@ -241,7 +250,6 @@ class SpaciousEditor extends CustomEditor {
 
     const frame = (value: string): string => `${fgRgb(EDITOR_FRAME)}${value}${RESET}`;
     const prompt = ` ${fgRgb(EDITOR_PROMPT)}❯${RESET} `;
-    const continuation = " ".repeat(visibleWidth(prompt));
     const innerWidth = Math.max(1, width - 2);
     const contentWidth = Math.max(1, innerWidth - visibleWidth(prompt));
     const lines = super.render(contentWidth);
@@ -258,13 +266,15 @@ class SpaciousEditor extends CustomEditor {
     const bodyLines = editorLines.length > 0 ? editorLines : [""];
 
     bodyLines.forEach((line, index) => {
-      const prefix = index === 0 ? prompt : continuation;
+      // 第一行显示提示符 ❯，后续折行保持干净缩进；截断并补齐右侧边框
+      const prefix = index === 0 ? prompt : "   ";
       const content = truncateToWidth(`${prefix}${line}`, innerWidth);
       const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
       result.push(`${frame("│")}${content}${padding}${frame("│")}`);
     });
 
-    while (result.length - 1 < EDITOR_MIN_BODY_ROWS) {
+    // 保持至少 2 行输入高度，避免框体过于扁平或拥挤
+    while (result.length - 1 < 2) {
       result.push(`${frame("│")}${" ".repeat(innerWidth)}${frame("│")}`);
     }
 
@@ -277,11 +287,6 @@ function addHistory(history: number[], value: number | undefined): void {
   if (value === undefined || !Number.isFinite(value)) return;
   history.push(value);
   if (history.length > HISTORY_LIMIT) history.shift();
-}
-
-function average(values: number[]): number | undefined {
-  if (values.length === 0) return undefined;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function formatNumber(value: number): string {
@@ -318,19 +323,6 @@ function formatCost(cost: number): string {
 function shorten(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, Math.max(1, max - 2))}..`;
-}
-
-function hitRate(read: number, input: number, write: number): number | null {
-  const prompt = read + input + write;
-  return prompt > 0 ? (read / prompt) * 100 : null;
-}
-
-function promptTokens(usage: {
-  input: number;
-  cacheRead: number;
-  cacheWrite: number;
-}): number {
-  return usage.input + usage.cacheRead + usage.cacheWrite;
 }
 
 async function readTextFile(path: string): Promise<string | undefined> {
@@ -371,6 +363,19 @@ function calculateCpuPercent(
   return Math.max(0, Math.min(100, ((totalDelta - idleDelta) / totalDelta) * 100));
 }
 
+function readOsCpuSample(): CpuSample | undefined {
+  const cores = cpus();
+  if (cores.length === 0) return undefined;
+
+  let idle = 0;
+  let total = 0;
+  for (const core of cores) {
+    idle += core.times.idle;
+    total += core.times.user + core.times.nice + core.times.sys + core.times.idle + core.times.irq;
+  }
+  return total > 0 ? { idle, total } : undefined;
+}
+
 function parseMemoryPercent(meminfo: string | undefined): number | undefined {
   if (!meminfo) return undefined;
   const values = new Map<string, number>();
@@ -384,6 +389,13 @@ function parseMemoryPercent(meminfo: string | undefined): number | undefined {
   return Math.max(0, Math.min(100, ((total - available) / total) * 100));
 }
 
+function readOsMemoryPercent(): number | undefined {
+  const total = totalmem();
+  const free = freemem();
+  if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) return undefined;
+  return Math.max(0, Math.min(100, ((total - free) / total) * 100));
+}
+
 function normalizeTemperature(raw: string | undefined): number | undefined {
   if (!raw) return undefined;
   const value = Number(raw.trim());
@@ -392,7 +404,106 @@ function normalizeTemperature(raw: string | undefined): number | undefined {
   return celsius >= -20 && celsius <= 150 ? celsius : undefined;
 }
 
-async function readCpuTemperature(): Promise<number | undefined> {
+let nextWindowsCpuTemperatureProbeAt = 0;
+
+async function readWindowsCpuTemperatureFile(): Promise<number | undefined> {
+  const text = await readTextFile(WINDOWS_CPU_TEMP_PATH);
+  if (!text) return undefined;
+
+  try {
+    const payload = JSON.parse(text) as { tempC?: unknown; updatedAt?: unknown };
+    const updatedAt = Number(payload.updatedAt);
+    const temperature = normalizeTemperature(String(payload.tempC ?? ""));
+    if (
+      temperature === undefined
+      || !Number.isFinite(updatedAt)
+      || Math.abs(Date.now() - updatedAt) > WINDOWS_CPU_TEMP_MAX_AGE_MS
+    ) {
+      return undefined;
+    }
+    return temperature;
+  } catch {
+    return undefined;
+  }
+}
+
+const WINDOWS_CPU_TEMPERATURE_SCRIPT = String.raw`
+$ErrorActionPreference = "SilentlyContinue"
+$namespaces = @("root/LibreHardwareMonitor", "root/OpenHardwareMonitor")
+foreach ($namespace in $namespaces) {
+  try {
+    $sensors = @(Get-CimInstance -Namespace $namespace -ClassName Sensor -Filter "SensorType = 'Temperature'" -ErrorAction Stop)
+  } catch {
+    continue
+  }
+
+  $ranked = foreach ($sensor in $sensors) {
+    $name = [string]$sensor.Name
+    $value = [double]$sensor.Value
+    $rank = if ($name -match "^CPU Package$") {
+      0
+    } elseif ($name -match "Tctl|Tdie") {
+      1
+    } elseif ($name -match "Core Max") {
+      2
+    } elseif ($name -match "^CPU Core") {
+      3
+    } else {
+      $null
+    }
+    if ($null -ne $rank -and $value -ge -20 -and $value -le 150) {
+      [pscustomobject]@{ Rank = $rank; Value = $value }
+    }
+  }
+
+  if ($ranked) {
+    $bestRank = ($ranked | Measure-Object Rank -Minimum).Minimum
+    $temperature = ($ranked | Where-Object Rank -eq $bestRank | Measure-Object Value -Maximum).Maximum
+    [Console]::WriteLine(([double]$temperature).ToString([Globalization.CultureInfo]::InvariantCulture))
+    exit 0
+  }
+}
+exit 1
+`;
+
+async function readWindowsCpuTemperature(
+  pi: ExtensionAPI,
+  force: boolean,
+): Promise<number | undefined> {
+  const now = Date.now();
+  const fileTemperature = await readWindowsCpuTemperatureFile();
+  if (fileTemperature !== undefined) {
+    nextWindowsCpuTemperatureProbeAt = now + SYSTEM_REFRESH_MS * WINDOWS_CPU_TEMP_REFRESH_EVERY;
+    return fileTemperature;
+  }
+  if (!force && now < nextWindowsCpuTemperatureProbeAt) return undefined;
+
+  let result: Awaited<ReturnType<ExtensionAPI["exec"]>>;
+  try {
+    result = await pi.exec(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_CPU_TEMPERATURE_SCRIPT],
+      { timeout: 2_500 },
+    );
+  } catch {
+    nextWindowsCpuTemperatureProbeAt = now + WINDOWS_CPU_TEMP_RETRY_MS;
+    return undefined;
+  }
+
+  const temperature = result.code === 0 ? normalizeTemperature(result.stdout) : undefined;
+  nextWindowsCpuTemperatureProbeAt = temperature === undefined
+    ? now + WINDOWS_CPU_TEMP_RETRY_MS
+    : now + SYSTEM_REFRESH_MS * WINDOWS_CPU_TEMP_REFRESH_EVERY;
+  return temperature;
+}
+
+async function readCpuTemperature(
+  pi: ExtensionAPI,
+  force = false,
+): Promise<number | undefined> {
+  if (process.platform === "win32") return readWindowsCpuTemperature(pi, force);
+  if (process.platform !== "linux") return undefined;
+
   const candidates: Array<{ rank: number; temp: number }> = [];
   for (const entry of await readDirectory("/sys/class/hwmon")) {
     const root = join("/sys/class/hwmon", entry);
@@ -513,27 +624,42 @@ function formatSystemTelemetry(
   const gpuPercent = formatPercent(metrics.gpuPercent);
   const gpuTemp = formatTemperature(metrics.gpuTempC);
 
+  const cpuTemperature = metrics.cpuTempC === undefined ? "" : ` ${cpuTemp}`;
+  const gpuTemperature = metrics.gpuTempC === undefined ? "" : ` ${gpuTemp}`;
+
   if (full) {
-    const segments = [`${icon("cpu")} CPU ${cpuPercent} ${cpuTemp}`];
+    const segments = [`${icon("cpu")} CPU ${cpuPercent}${cpuTemperature}`];
     if (hasGpu) {
       const vram = metrics.gpuMemoryPercent === undefined
         ? ""
         : ` / 显存 ${formatPercent(metrics.gpuMemoryPercent)}`;
-      segments.push(`${icon("gpu")} GPU ${gpuPercent}${vram} ${gpuTemp}`);
+      segments.push(`${icon("gpu")} GPU ${gpuPercent}${vram}${gpuTemperature}`);
     }
     segments.push(`${icon("memory")} 内存 ${memory}`);
     return segments.join(" · ");
   }
 
   if (compact) {
-    const segments = [`${icon("cpu")}${cpuPercent.replace("%", "")}/${cpuTemp}`];
-    if (hasGpu) segments.push(`${icon("gpu")}${gpuPercent.replace("%", "")}/${gpuTemp}`);
+    const cpuCompact = metrics.cpuTempC === undefined
+      ? cpuPercent.replace("%", "")
+      : `${cpuPercent.replace("%", "")}/${cpuTemp}`;
+    const segments = [`${icon("cpu")}${cpuCompact}`];
+    if (hasGpu) {
+      const gpuCompact = metrics.gpuTempC === undefined
+        ? gpuPercent.replace("%", "")
+        : `${gpuPercent.replace("%", "")}/${gpuTemp}`;
+      segments.push(`${icon("gpu")}${gpuCompact}`);
+    }
     segments.push(`${icon("memory")}${memory.replace("%", "")}`);
     return segments.join(" ");
   }
 
-  const segments = [`${icon("cpu")}${cpuPercent}/${cpuTemp}`];
-  if (hasGpu) segments.push(`${icon("gpu")}${gpuPercent}/${gpuTemp}`);
+  const cpuDetail = metrics.cpuTempC === undefined ? cpuPercent : `${cpuPercent}/${cpuTemp}`;
+  const segments = [`${icon("cpu")}${cpuDetail}`];
+  if (hasGpu) {
+    const gpuDetail = metrics.gpuTempC === undefined ? gpuPercent : `${gpuPercent}/${gpuTemp}`;
+    segments.push(`${icon("gpu")}${gpuDetail}`);
+  }
   segments.push(`${icon("memory")}${memory}`);
   return segments.join(" ");
 }
@@ -554,73 +680,6 @@ function systemModuleBackground(metrics: SystemTelemetry): RGB {
     return PALETTE.systemWarnBg;
   }
   return PALETTE.systemBg;
-}
-
-function isMcpToolResult(toolName: string, details: unknown): boolean {
-  if (toolName === "mcp") return true;
-  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
-  const value = details as Record<string, unknown>;
-  return typeof value.server === "string" && (
-    typeof value.tool === "string" || typeof value.resourceUri === "string"
-  );
-}
-
-function addUsage(stats: SessionStats, usage: UsageWithReasoning): void {
-  stats.input += usage.input ?? 0;
-  stats.output += usage.output ?? 0;
-  stats.cacheRead += usage.cacheRead ?? 0;
-  stats.cacheWrite += usage.cacheWrite ?? 0;
-  stats.reasoning += usage.reasoning ?? 0;
-  stats.cost += usage.cost?.total ?? 0;
-}
-
-function calculateSessionStats(ctx: ExtensionContext): SessionStats {
-  const stats: SessionStats = {
-    calls: 0,
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    reasoning: 0,
-    cost: 0,
-    toolCalls: 0,
-    mcpCalls: 0,
-    lastModel: undefined,
-    lastCacheHit: null,
-  };
-
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type === "message" && entry.message.role === "assistant") {
-      const message = entry.message as AssistantMessage;
-      const usage = message.usage as UsageWithReasoning;
-      stats.calls += 1;
-      addUsage(stats, usage);
-      stats.lastModel = {
-        input: usage.input ?? 0,
-        output: usage.output ?? 0,
-        cacheRead: usage.cacheRead ?? 0,
-        cacheWrite: usage.cacheWrite ?? 0,
-        reasoning: usage.reasoning ?? 0,
-      };
-      stats.lastCacheHit = hitRate(usage.cacheRead, usage.input, usage.cacheWrite);
-      continue;
-    }
-
-    if (entry.type === "message" && entry.message.role === "toolResult") {
-      stats.toolCalls += 1;
-      if (isMcpToolResult(entry.message.toolName, entry.message.details)) {
-        stats.mcpCalls += 1;
-      }
-      if (entry.message.usage) addUsage(stats, entry.message.usage as UsageWithReasoning);
-      continue;
-    }
-
-    if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage) {
-      addUsage(stats, entry.usage as UsageWithReasoning);
-    }
-  }
-
-  return stats;
 }
 
 function moduleWidth(module: PowerlineModule): number {
@@ -717,25 +776,16 @@ function sparkline(values: number[], maxLength: number): string {
 }
 
 function renderDashboard(theme: Theme, items: DashboardItem[], width: number): string {
-  const visible = [...items];
   const separator = theme.fg("borderMuted", "  │  ");
-  const lineWidth = (): number =>
-    visible.reduce((sum, item) => sum + visibleWidth(item.text), 0) +
-    Math.max(0, visible.length - 1) * 5;
-
-  while (visible.length > 1 && lineWidth() > width) {
-    let removeAt = -1;
-    let lowestPriority = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < visible.length; i++) {
-      if (visible[i].priority < lowestPriority) {
-        lowestPriority = visible[i].priority;
-        removeAt = i;
-      }
-    }
-    if (removeAt < 0) break;
-    visible.splice(removeAt, 1);
-  }
-
+  const visibleIds = new Set(fitDashboardItems(
+    items.map((item) => ({
+      id: item.id,
+      width: visibleWidth(item.text),
+      priority: item.priority,
+    })),
+    width,
+  ));
+  const visible = items.filter((item) => visibleIds.has(item.id));
   return truncateToWidth(visible.map((item) => item.text).join(separator), Math.max(1, width), "");
 }
 
@@ -774,7 +824,36 @@ function telemetryValue(telemetry: ApiTelemetry, now: number): {
 }
 
 export default function comprehensiveStatus(pi: ExtensionAPI): void {
-  const telemetry: ApiTelemetry = { headers: [], ttfts: [], totals: [] };
+  // Gracefully filter unhandled AbortError rejections (e.g. from credentials raceWithAbortSignal,
+  // fetch reader cancellations, or background token refresh on user Esc), preventing Pi from
+  // crashing due to uncaughtException.
+  if (typeof process !== "undefined" && typeof process.on === "function") {
+    process.on("unhandledRejection", (reason: unknown) => {
+      if (
+        reason &&
+        typeof reason === "object" &&
+        ("name" in reason || "code" in reason || "message" in reason)
+      ) {
+        const err = reason as { name?: unknown; code?: unknown; message?: unknown };
+        if (
+          err.name === "AbortError" ||
+          err.code === 20 ||
+          (typeof err.message === "string" &&
+            (err.message.includes("aborted") ||
+              err.message.includes("AbortError") ||
+              err.message.includes("This operation was aborted") ||
+              err.message.includes("The operation was aborted")))
+        ) {
+          // Expected cancellation error during user abort/Esc; absorb safely.
+          return;
+        }
+      }
+      // Re-throw other non-abort rejections so they can be surfaced normally.
+      throw reason;
+    });
+  }
+
+  const telemetry: ApiTelemetry = { ttfts: [] };
   const task: TaskTelemetry = {};
   let git: GitState = { available: false, branch: null, dirtyFiles: 0 };
   let renderNow: (() => void) | undefined;
@@ -789,10 +868,23 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
   let systemRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let systemWarmupTimer: ReturnType<typeof setTimeout> | undefined;
   let gpuRefreshCounter = 0;
+  let cpuTempRefreshCounter = 0;
   let mcpConfiguredServers: number | undefined;
   let activeMcpCalls = 0;
+  let mobileStatusEnabled = process.env.MOSHI_CLIENT === "1";
 
   const requestRender = (): void => renderNow?.();
+  const stopMobileStatusListener = pi.events.on(MOBILE_STATUS_EVENT, (data) => {
+    if (!data || typeof data !== "object") return;
+    const request = data as Partial<MobileStatusRequest>;
+    if (!new Set(["toggle", "mobile", "desktop"]).has(String(request.mode))) return;
+    mobileStatusEnabled = request.mode === "toggle"
+      ? !mobileStatusEnabled
+      : request.mode === "mobile";
+    request.handled = true;
+    request.enabled = mobileStatusEnabled;
+    requestRender();
+  });
 
   const stopSystemRefresh = (): void => {
     if (systemRefreshTimer) clearInterval(systemRefreshTimer);
@@ -805,23 +897,30 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
     if (systemRefreshRunning) return;
     systemRefreshRunning = true;
     const refreshGpu = forceGpu || gpuRefreshCounter % GPU_REFRESH_EVERY === 0;
+    const refreshCpuTemp = process.platform !== "win32"
+      || forceGpu
+      || cpuTempRefreshCounter % WINDOWS_CPU_TEMP_REFRESH_EVERY === 0;
     gpuRefreshCounter += 1;
+    cpuTempRefreshCounter += 1;
 
     try {
+      const linux = process.platform === "linux";
       const [stat, meminfo, cpuTempC, gpu] = await Promise.all([
-        readTextFile("/proc/stat"),
-        readTextFile("/proc/meminfo"),
-        readCpuTemperature(),
+        linux ? readTextFile("/proc/stat") : Promise.resolve(undefined),
+        linux ? readTextFile("/proc/meminfo") : Promise.resolve(undefined),
+        refreshCpuTemp ? readCpuTemperature(pi, forceGpu) : Promise.resolve(undefined),
         refreshGpu ? readGpuTelemetry(pi) : Promise.resolve(undefined),
       ]);
-      const cpuSample = parseCpuSample(stat);
+      const cpuSample = parseCpuSample(stat) ?? readOsCpuSample();
       const cpuPercent = calculateCpuPercent(previousCpuSample, cpuSample);
       if (cpuSample) previousCpuSample = cpuSample;
 
       systemMetrics = {
         ...systemMetrics,
         cpuPercent: cpuPercent ?? systemMetrics.cpuPercent,
-        memoryPercent: parseMemoryPercent(meminfo) ?? systemMetrics.memoryPercent,
+        memoryPercent: parseMemoryPercent(meminfo)
+          ?? readOsMemoryPercent()
+          ?? systemMetrics.memoryPercent,
         cpuTempC: cpuTempC ?? systemMetrics.cpuTempC,
       };
       if (gpu) {
@@ -840,6 +939,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
     stopSystemRefresh();
     previousCpuSample = undefined;
     gpuRefreshCounter = 0;
+    cpuTempRefreshCounter = 0;
     void refreshSystemMetrics(true);
     systemWarmupTimer = setTimeout(() => {
       systemWarmupTimer = undefined;
@@ -858,7 +958,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
   const getStats = (ctx: ExtensionContext): SessionStats => {
     const leaf = ctx.sessionManager.getLeafId();
     if (!cachedStats || leaf !== statsLeaf) {
-      cachedStats = calculateSessionStats(ctx);
+      cachedStats = calculateSessionStats(ctx.sessionManager.getEntries());
       statsLeaf = leaf;
     }
     return cachedStats;
@@ -905,7 +1005,6 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
     if (telemetry.activeStart !== undefined) {
       telemetry.activeHeaderMs = performance.now() - telemetry.activeStart;
       telemetry.lastHeaderMs = telemetry.activeHeaderMs;
-      addHistory(telemetry.headers, telemetry.activeHeaderMs);
     }
     requestRender();
   });
@@ -928,7 +1027,6 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
     if (telemetry.activeStart !== undefined) {
       telemetry.lastTotalMs = performance.now() - telemetry.activeStart;
       addHistory(telemetry.ttfts, telemetry.activeFirstMs);
-      addHistory(telemetry.totals, telemetry.lastTotalMs);
     }
     telemetry.lastError = event.message.stopReason === "error"
       ? event.message.errorMessage ?? "stream error"
@@ -998,13 +1096,13 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
     ctx.ui.setWidget("visual-status", undefined);
 
     const buildStatusLines = (theme: Theme, width: number): [string, string[]] => {
-          const safeWidth = Math.max(1, width - (NERD_FONT ? 2 : 0));
+          const safeWidth = Math.max(1, width - (process.platform === "win32" ? 2 : NERD_FONT ? 2 : 0));
           const stats = getStats(ctx);
           const now = performance.now();
           const latency = telemetryValue(telemetry, now);
           const context = ctx.getContextUsage();
           const contextPercent = context?.percent ?? null;
-          const cacheHit = hitRate(stats.cacheRead, stats.input, stats.cacheWrite);
+          const cacheHit = cacheHitRate(stats);
           const branch = git.branch;
           const sessionName = pi.getSessionName();
           const full = safeWidth >= 200;
@@ -1016,6 +1114,24 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
             : "no-model";
           const model = full ? qualifiedModel : ctx.model?.id ?? qualifiedModel;
           const thinking = ctx.thinkingLevel ?? "off";
+          const workflow = resolveTodoWorkflowState(ctx.sessionManager.getEntries());
+          if (mobileStatusEnabled) {
+            const taskElapsed = task.activeStart === undefined
+              ? task.lastTotalMs
+              : now - task.activeStart;
+            const mobileLines = formatMobileStatusLines({
+              model: ctx.model?.id ?? "no-model",
+              thinking,
+              workflow,
+              cacheHit,
+              responseMs: latency.header,
+              firstTokenMs: latency.ttft,
+              taskMs: taskElapsed,
+              taskActive: task.activeStart !== undefined,
+            }, safeWidth);
+            return [mobileLines[0], [mobileLines[1]]];
+          }
+          const workflowText = formatTodoWorkflowText(workflow, safeWidth < 120);
           const active = telemetry.activeStart !== undefined;
           const failed = telemetry.lastError !== undefined || (telemetry.lastStatus ?? 0) >= 400;
           const warningStatus = [408, 409, 429].includes(telemetry.lastStatus ?? 0);
@@ -1026,7 +1142,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
               ? withIcon("warning", shorten(telemetry.lastError, 20))
               : telemetry.lastStatus === undefined
                 ? withIcon("api", "待命")
-                : withIcon("api", `${telemetry.lastStatus} · 首字${formatDuration(latency.ttft)}`);
+                : withIcon("api", `HTTP ${telemetry.lastStatus}`);
 
           const leftModules: PowerlineModule[] = [
             {
@@ -1051,6 +1167,17 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
               bg: PALETTE.thinkBg,
               fg: PALETTE.thinkFg,
               priority: 95,
+            },
+            {
+              id: "workflow",
+              text: withIcon("workflow", workflowText),
+              bg: workflow.mode === "executing"
+                ? PALETTE.workflowExecuteBg
+                : workflow.mode === "pending"
+                  ? PALETTE.workflowPlanBg
+                  : PALETTE.workflowNormalBg,
+              fg: PALETTE.workflowFg,
+              priority: 110,
             },
             {
               id: "directory",
@@ -1135,12 +1262,12 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
             ? "--"
             : `${mcpConfiguredServers}`;
           const mcpText = detailed
-            ? `MCP ${mcpServers}服务 · 调用 ${stats.mcpCalls}` +
+            ? withIcon("mcp", `MCP ${mcpServers}服务 · 调用 ${stats.mcpCalls}`) +
               (activeMcpCalls > 0 ? ` · ${spinner} 调用中` : "")
             : safeWidth >= 120
-              ? `MCP ${mcpServers}服/${stats.mcpCalls}次` +
+              ? withIcon("mcp", `MCP ${mcpServers}服/${stats.mcpCalls}次`) +
                 (activeMcpCalls > 0 ? ` ${spinner}` : "")
-              : `MCP${mcpServers}/${stats.mcpCalls}` +
+              : `${icon("mcp")}MCP${mcpServers}/${stats.mcpCalls}` +
                 (activeMcpCalls > 0 ? spinner : "");
           rightModules.push({
             id: "mcp",
@@ -1155,78 +1282,60 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
           const latencyHistory = telemetry.activeFirstMs === undefined
             ? telemetry.ttfts
             : [...telemetry.ttfts, telemetry.activeFirstMs];
-          const latencyDetail = medium
-            ? `响应${formatDuration(latency.header)} · ` +
-              `首字${formatDuration(currentTtft)} · ` +
-              `完成${formatDuration(latency.total)}`
-            : `响应${formatDuration(latency.header)} ` +
-              `首字${formatDuration(currentTtft)} ` +
-              `完成${formatDuration(latency.total)}`;
+          const responseMetric = medium
+            ? withIcon("response", `响应 ${formatDuration(latency.header)}`)
+            : `${icon("response")}${formatDuration(latency.header)}`;
+          const firstTokenMetric = medium
+            ? withIcon("firstToken", `首字 ${formatDuration(currentTtft)}`)
+            : `${icon("firstToken")}${formatDuration(currentTtft)}`;
+          const latencyTrend = wide ? ` · ${sparkline(latencyHistory, 6)}` : "";
           const taskElapsed = task.activeStart === undefined
             ? task.lastTotalMs
             : now - task.activeStart;
-          const totalInput = promptTokens(stats);
-          const lastInput = stats.lastModel ? promptTokens(stats.lastModel) : undefined;
-          const lastOutput = stats.lastModel?.output;
-          const lastReasoning = stats.lastModel?.reasoning;
-          const totalInputText = formatNumber(totalInput);
+          const totalInputText = formatNumber(stats.input);
           const totalOutputText = formatNumber(stats.output);
           const totalReasoningText = formatNumber(stats.reasoning);
-          const lastInputText = lastInput === undefined ? "--" : formatNumber(lastInput);
-          const lastOutputText = lastOutput === undefined ? "--" : formatNumber(lastOutput);
-          const lastReasoningText = lastReasoning === undefined ? "--" : formatNumber(lastReasoning);
           const totalUsageGroup =
-            theme.fg(
-              "accent",
-              `${icon("usage")} 总输入${totalInputText} · 总输出${totalOutputText}`,
-            ) +
-            theme.fg("warning", `（推理${totalReasoningText}）`);
-          const singleUsageGroup =
-            theme.fg(
-              "success",
-              `Δ 单次输入${lastInputText} · 单次输出${lastOutputText}`,
-            ) +
-            (stats.lastModel
-              ? theme.fg("warning", `（推理${lastReasoningText}）`)
-              : "");
-          const usageSeparator = theme.fg(
-            "borderMuted",
-            safeWidth < 80 ? "║" : " ║ ",
-          );
-          const usageComparison = totalUsageGroup + usageSeparator + singleUsageGroup;
+            theme.fg("accent", `${withIcon("input", `累计输入 ${totalInputText}`)} · `) +
+            theme.fg("success", withIcon("output", `累计输出 ${totalOutputText}`)) +
+            theme.fg("warning", ` · ${withIcon("reasoning", `推理 ${totalReasoningText}`)}`);
+          const cacheDetail = detailed
+            ? ` · 读 ${formatNumber(stats.cacheRead)} · 写 ${stats.cacheWrite > 0 ? formatNumber(stats.cacheWrite) : stats.cacheRead > 0 ? "未报" : "0"}`
+            : wide
+              ? ` · 读 ${formatNumber(stats.cacheRead)}`
+              : "";
           const dashboard: DashboardItem[] = [
             {
-              priority: 94,
+              id: "cache",
+              priority: 120,
               text:
-                theme.fg(cacheTextColor, `${withIcon("cache", "缓存命中")} `) +
-                theme.fg(cacheTextColor, cacheHit === null
-                  ? "--"
-                  : `${Math.round(cacheHit)}%`) +
-                (wide
-                  ? theme.fg(
-                      "dim",
-                      ` · 读${formatNumber(stats.cacheRead)} 写${stats.cacheWrite > 0 ? formatNumber(stats.cacheWrite) : stats.cacheRead > 0 ? "未报" : "0"}`,
-                    )
-                  : ""),
-            },
-            {
-              priority: 97,
-              text:
+                theme.fg(cacheTextColor, `${withIcon("cache", "缓存")} `) +
                 theme.fg(
-                  latencyColor(currentTtft),
-                  `${icon("latency")} ${sparkline(latencyHistory, wide ? 10 : medium ? 6 : 3)} `,
+                  cacheTextColor,
+                  cacheHit === null ? "--" : `${cacheHit.toFixed(detailed ? 1 : 0)}%`,
                 ) +
-                theme.fg(latencyColor(currentTtft), latencyDetail),
+                theme.fg("dim", cacheDetail),
             },
             {
-              priority: 110,
-              text: usageComparison,
+              id: "latency",
+              priority: 105,
+              text:
+                theme.fg(latencyColor(latency.header), responseMetric) +
+                theme.fg("borderMuted", " · ") +
+                theme.fg(latencyColor(currentTtft), firstTokenMetric) +
+                theme.fg("dim", latencyTrend),
+            },
+            {
+              id: "usage",
+              priority: 115,
+              text: totalUsageGroup,
             },
           ];
 
           if (taskElapsed !== undefined) {
-            dashboard.splice(2, 0, {
-              priority: 105,
+            dashboard.push({
+              id: "task",
+              priority: 100,
               text: theme.fg(
                 task.activeStart === undefined ? "success" : "warning",
                 withIcon(
@@ -1239,6 +1348,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
 
           if (stats.cost > 0) {
             dashboard.push({
+              id: "cost",
               priority: 12,
               text: theme.fg(
                 "success",
@@ -1250,24 +1360,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
           }
 
           const primaryLine = renderPowerline(leftModules, rightModules, safeWidth);
-          if (visibleWidth(usageComparison) > safeWidth) {
-            const supportingDashboard = dashboard.filter(
-              (item) => item.text !== usageComparison,
-            );
-            const supportingLine = renderDashboard(theme, supportingDashboard, safeWidth);
-            const usageLines = [totalUsageGroup, singleUsageGroup].map((line) =>
-              truncateToWidth(line, safeWidth, "")
-            );
-            return [
-              primaryLine,
-              supportingLine ? [supportingLine, ...usageLines] : usageLines,
-            ];
-          }
-
-          return [
-            primaryLine,
-            [renderDashboard(theme, dashboard, safeWidth)],
-          ];
+          return [primaryLine, [renderDashboard(theme, dashboard, safeWidth)]];
     };
 
     const statusComponent = (lineIndex: 0 | 1, animated: boolean) =>
@@ -1305,6 +1398,7 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    stopMobileStatusListener();
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = undefined;
     stopSystemRefresh();
@@ -1341,19 +1435,20 @@ export default function comprehensiveStatus(pi: ExtensionAPI): void {
         [
           "响应 = request to HTTP response headers",
           "首字 = request to first visible model token",
-          "完成 = request to complete assistant response",
-          "The sparkline shows first-token latency across the last 10 model calls",
+          "The short sparkline shows first-token latency across up to 6 model calls",
           "任务中/上次任务 = total agent wall time including model and tool calls",
-          "模型轮数/工具调用 = cumulative model response rounds and tool results on this branch",
-          "CPU/GPU/内存 = live Linux utilization; temperatures come from hwmon and nvidia-smi",
-          "MCP N服务/调用N = configured MCP servers and cumulative MCP tool results on this branch",
+          "模型轮数/工具调用 = cumulative model response rounds and tool results in this session",
+          "CPU/内存 = live host utilization selected for the current platform",
+          "CPU temperature = Linux hwmon/thermal zones; Windows helper runtime file with WMI fallback",
+          "GPU/显存/温度 = nvidia-smi when an NVIDIA GPU is available",
+          "MCP N服务/调用N = configured MCP servers and cumulative MCP tool results in this session",
           "MCP 调用中 = one or more MCP proxy calls are currently running",
-          "缓存命中 = cacheRead / (input + cacheRead + cacheWrite); higher is better",
+          "缓存 = session cacheRead / (input + cacheRead + cacheWrite); higher is better",
           "写未报 = the provider reports cache reads but no cache-creation/write metric",
-          "总输入/总输出 = cumulative cache-inclusive prompt tokens and generated tokens on this branch",
-          "单次输入/单次输出 = cache-inclusive prompt tokens and generated tokens from the latest model response",
-          "推理 = the reasoning subset shown separately for total and latest-call output",
-          "Cache and token totals are cumulative for the current session branch",
+          "累计输入 = Pi-native uncached input; cache reads and writes are shown separately",
+          "累计输出 = generated output from model responses, nested tools, compaction, and branch summaries",
+          "推理 = an output-token subset; do not add it to output again",
+          "Cache and token totals cover all recorded entries in the current session",
           "SESSION is Pi's native session name set with /name",
         ].join("\n"),
         "info",
